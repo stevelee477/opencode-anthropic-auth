@@ -1,6 +1,9 @@
 import { generatePKCE } from "@openauthjs/openauth/pkce";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const TOOL_PREFIX = "mcp_";
+const USER_AGENT = "claude-cli/2.1.2 (external, cli)";
+const BASE_BETAS = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
 
 /**
  * @param {"max" | "console"} mode
@@ -66,6 +69,167 @@ async function exchange(code, verifier) {
 }
 
 /**
+ * @param {RequestInfo | URL} input
+ * @param {HeadersInit | undefined} initHeaders
+ */
+function mergeHeaders(input, initHeaders) {
+  const headers = new Headers();
+
+  if (input instanceof Request) {
+    input.headers.forEach((value, key) => {
+      headers.set(key, value);
+    });
+  }
+
+  if (!initHeaders) return headers;
+
+  if (initHeaders instanceof Headers) {
+    initHeaders.forEach((value, key) => {
+      headers.set(key, value);
+    });
+    return headers;
+  }
+
+  if (Array.isArray(initHeaders)) {
+    for (const [key, value] of initHeaders) {
+      if (typeof value !== "undefined") {
+        headers.set(key, String(value));
+      }
+    }
+    return headers;
+  }
+
+  for (const [key, value] of Object.entries(initHeaders)) {
+    if (typeof value !== "undefined") {
+      headers.set(key, String(value));
+    }
+  }
+
+  return headers;
+}
+
+/**
+ * @param {RequestInfo | URL} input
+ */
+function getRequestUrl(input) {
+  try {
+    if (typeof input === "string" || input instanceof URL) {
+      return new URL(input.toString());
+    }
+    if (input instanceof Request) {
+      return new URL(input.url);
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * @param {RequestInfo | URL} input
+ */
+function addMessagesBetaParam(input) {
+  let requestInput = input;
+  const requestUrl = getRequestUrl(input);
+
+  if (
+    requestUrl &&
+    requestUrl.pathname === "/v1/messages" &&
+    !requestUrl.searchParams.has("beta")
+  ) {
+    requestUrl.searchParams.set("beta", "true");
+    requestInput =
+      input instanceof Request ? new Request(requestUrl.toString(), input) : requestUrl;
+  }
+
+  return { requestInput, requestUrl };
+}
+
+/**
+ * @param {Headers} headers
+ */
+function applyDefaultHeaders(headers) {
+  const incomingBeta = headers.get("anthropic-beta") || "";
+  const includeClaudeCode = incomingBeta
+    .split(",")
+    .map((b) => b.trim())
+    .filter(Boolean)
+    .includes("claude-code-20250219");
+
+  headers.set(
+    "anthropic-beta",
+    [...BASE_BETAS, ...(includeClaudeCode ? ["claude-code-20250219"] : [])].join(","),
+  );
+  headers.set("user-agent", USER_AGENT);
+
+  return headers;
+}
+
+/**
+ * @param {any} body
+ */
+function addToolPrefixToBody(body) {
+  if (!body || typeof body !== "string") return body;
+
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed.tools && Array.isArray(parsed.tools)) {
+      parsed.tools = parsed.tools.map((tool) => ({
+        ...tool,
+        name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
+      }));
+    }
+    if (parsed.messages && Array.isArray(parsed.messages)) {
+      parsed.messages = parsed.messages.map((msg) => {
+        if (msg.content && Array.isArray(msg.content)) {
+          msg.content = msg.content.map((block) => {
+            if (block.type === "tool_use" && block.name) {
+              return { ...block, name: `${TOOL_PREFIX}${block.name}` };
+            }
+            return block;
+          });
+        }
+        return msg;
+      });
+    }
+    return JSON.stringify(parsed);
+  } catch {
+    return body;
+  }
+}
+
+/**
+ * @param {Response} response
+ */
+function stripToolPrefixFromResponse(response) {
+  if (!response.body) return response;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+
+      let text = decoder.decode(value, { stream: true });
+      text = text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"');
+      controller.enqueue(encoder.encode(text));
+    },
+  });
+
+  return new Response(stream, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+/**
  * @type {import('@opencode-ai/plugin').Plugin}
  */
 export async function AnthropicAuthPlugin({ client }) {
@@ -128,112 +292,14 @@ export async function AnthropicAuthPlugin({ client }) {
                 auth.access = json.access_token;
               }
               const requestInit = init ?? {};
-
-              const requestHeaders = new Headers();
-              if (input instanceof Request) {
-                input.headers.forEach((value, key) => {
-                  requestHeaders.set(key, value);
-                });
-              }
-              if (requestInit.headers) {
-                if (requestInit.headers instanceof Headers) {
-                  requestInit.headers.forEach((value, key) => {
-                    requestHeaders.set(key, value);
-                  });
-                } else if (Array.isArray(requestInit.headers)) {
-                  for (const [key, value] of requestInit.headers) {
-                    if (typeof value !== "undefined") {
-                      requestHeaders.set(key, String(value));
-                    }
-                  }
-                } else {
-                  for (const [key, value] of Object.entries(requestInit.headers)) {
-                    if (typeof value !== "undefined") {
-                      requestHeaders.set(key, String(value));
-                    }
-                  }
-                }
-              }
-
-              const incomingBeta = requestHeaders.get("anthropic-beta") || "";
-              const incomingBetasList = incomingBeta
-                .split(",")
-                .map((b) => b.trim())
-                .filter(Boolean);
-
-              const includeClaudeCode = incomingBetasList.includes(
-                "claude-code-20250219",
+              const requestHeaders = applyDefaultHeaders(
+                mergeHeaders(input, requestInit.headers),
               );
-
-              const mergedBetas = [
-                "oauth-2025-04-20",
-                "interleaved-thinking-2025-05-14",
-                ...(includeClaudeCode ? ["claude-code-20250219"] : []),
-              ].join(",");
-
               requestHeaders.set("authorization", `Bearer ${auth.access}`);
-              requestHeaders.set("anthropic-beta", mergedBetas);
-              requestHeaders.set(
-                "user-agent",
-                "claude-cli/2.1.2 (external, cli)",
-              );
               requestHeaders.delete("x-api-key");
 
-              const TOOL_PREFIX = "mcp_";
-              let body = requestInit.body;
-              if (body && typeof body === "string") {
-                try {
-                  const parsed = JSON.parse(body);
-                  // Add prefix to tools definitions
-                  if (parsed.tools && Array.isArray(parsed.tools)) {
-                    parsed.tools = parsed.tools.map((tool) => ({
-                      ...tool,
-                      name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
-                    }));
-                  }
-                  // Add prefix to tool_use blocks in messages
-                  if (parsed.messages && Array.isArray(parsed.messages)) {
-                    parsed.messages = parsed.messages.map((msg) => {
-                      if (msg.content && Array.isArray(msg.content)) {
-                        msg.content = msg.content.map((block) => {
-                          if (block.type === "tool_use" && block.name) {
-                            return { ...block, name: `${TOOL_PREFIX}${block.name}` };
-                          }
-                          return block;
-                        });
-                      }
-                      return msg;
-                    });
-                  }
-                  body = JSON.stringify(parsed);
-                } catch (e) {
-                  // ignore parse errors
-                }
-              }
-
-              let requestInput = input;
-              let requestUrl = null;
-              try {
-                if (typeof input === "string" || input instanceof URL) {
-                  requestUrl = new URL(input.toString());
-                } else if (input instanceof Request) {
-                  requestUrl = new URL(input.url);
-                }
-              } catch {
-                requestUrl = null;
-              }
-
-              if (
-                requestUrl &&
-                requestUrl.pathname === "/v1/messages" &&
-                !requestUrl.searchParams.has("beta")
-              ) {
-                requestUrl.searchParams.set("beta", "true");
-                requestInput =
-                  input instanceof Request
-                    ? new Request(requestUrl.toString(), input)
-                    : requestUrl;
-              }
+              const body = addToolPrefixToBody(requestInit.body);
+              const { requestInput } = addMessagesBetaParam(input);
 
               const response = await fetch(requestInput, {
                 ...requestInit,
@@ -241,34 +307,36 @@ export async function AnthropicAuthPlugin({ client }) {
                 headers: requestHeaders,
               });
 
-              // Transform streaming response to rename tools back
-              if (response.body) {
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                const encoder = new TextEncoder();
+              return stripToolPrefixFromResponse(response);
+            },
+          };
+        }
 
-                const stream = new ReadableStream({
-                  async pull(controller) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                      controller.close();
-                      return;
-                    }
+        if (auth.type === "api") {
+          return {
+            /**
+             * @param {any} input
+             * @param {any} init
+             */
+            async fetch(input, init) {
+              const auth = await getAuth();
+              if (auth.type !== "api") return fetch(input, init);
 
-                    let text = decoder.decode(value, { stream: true });
-                    text = text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"');
-                    controller.enqueue(encoder.encode(text));
-                  },
-                });
+              const requestInit = init ?? {};
+              const requestHeaders = applyDefaultHeaders(
+                mergeHeaders(input, requestInit.headers),
+              );
 
-                return new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers,
-                });
-              }
+              const body = addToolPrefixToBody(requestInit.body);
+              const { requestInput } = addMessagesBetaParam(input);
 
-              return response;
+              const response = await fetch(requestInput, {
+                ...requestInit,
+                body,
+                headers: requestHeaders,
+              });
+
+              return stripToolPrefixFromResponse(response);
             },
           };
         }
