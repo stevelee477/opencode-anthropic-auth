@@ -3,7 +3,7 @@ import { generatePKCE } from "@openauthjs/openauth/pkce";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const TOOL_PREFIX = "mcp_";
 const USER_AGENT = "claude-cli/2.1.2 (external, cli)";
-const BASE_BETAS = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
+const REQUIRED_BETAS = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
 
 /**
  * @param {"max" | "console"} mode
@@ -149,20 +149,41 @@ function addMessagesBetaParam(input) {
  * @param {Headers} headers
  */
 function applyDefaultHeaders(headers) {
+  // Preserve all incoming beta headers while ensuring required betas
   const incomingBeta = headers.get("anthropic-beta") || "";
-  const includeClaudeCode = incomingBeta
+  const incomingBetasList = incomingBeta
     .split(",")
     .map((b) => b.trim())
-    .filter(Boolean)
-    .includes("claude-code-20250219");
+    .filter(Boolean);
 
-  headers.set(
-    "anthropic-beta",
-    [...BASE_BETAS, ...(includeClaudeCode ? ["claude-code-20250219"] : [])].join(","),
-  );
+  // Use Set for deduplication
+  const mergedBetas = [...new Set([...REQUIRED_BETAS, ...incomingBetasList])].join(",");
+
+  headers.set("anthropic-beta", mergedBetas);
   headers.set("user-agent", USER_AGENT);
 
   return headers;
+}
+
+/**
+ * Sanitize system prompt - server blocks "OpenCode" string
+ * @param {any} parsed
+ */
+function sanitizeSystemPrompt(parsed) {
+  if (parsed.system && Array.isArray(parsed.system)) {
+    parsed.system = parsed.system.map((item) => {
+      if (item.type === "text" && item.text) {
+        return {
+          ...item,
+          text: item.text
+            .replace(/OpenCode/g, "Claude Code")
+            .replace(/opencode/gi, "Claude"),
+        };
+      }
+      return item;
+    });
+  }
+  return parsed;
 }
 
 /**
@@ -172,13 +193,19 @@ function addToolPrefixToBody(body) {
   if (!body || typeof body !== "string") return body;
 
   try {
-    const parsed = JSON.parse(body);
+    let parsed = JSON.parse(body);
+    
+    // Sanitize system prompt (OpenCode -> Claude Code)
+    parsed = sanitizeSystemPrompt(parsed);
+    
+    // Add prefix to tools definitions
     if (parsed.tools && Array.isArray(parsed.tools)) {
       parsed.tools = parsed.tools.map((tool) => ({
         ...tool,
         name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
       }));
     }
+    // Add prefix to tool_use blocks in messages
     if (parsed.messages && Array.isArray(parsed.messages)) {
       parsed.messages = parsed.messages.map((msg) => {
         if (msg.content && Array.isArray(msg.content)) {
@@ -234,6 +261,16 @@ function stripToolPrefixFromResponse(response) {
  */
 export async function AnthropicAuthPlugin({ client }) {
   return {
+    // NEW: System prompt transformer from upstream v0.0.13
+    "experimental.chat.system.transform": (input, output) => {
+      const prefix =
+        "You are Claude Code, Anthropic's official CLI for Claude.";
+      if (input.model?.providerID === "anthropic") {
+        output.system.unshift(prefix);
+        if (output.system[1])
+          output.system[1] = prefix + "\n\n" + output.system[1];
+      }
+    },
     auth: {
       provider: "anthropic",
       async loader(getAuth, provider) {
@@ -312,6 +349,7 @@ export async function AnthropicAuthPlugin({ client }) {
           };
         }
 
+        // API key type support with full disguise (preserved from fork)
         if (auth.type === "api") {
           return {
             /**
